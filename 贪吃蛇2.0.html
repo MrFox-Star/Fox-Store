@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>贪吃蛇 Snake</title>
+<style>
+  /* ============ 页面与画布样式 ============ */
+  :root { --bg:#0f172a; --wall:#475569; }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; min-height:100vh; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:10px;
+    background:var(--bg); color:#e2e8f0;
+    font-family: Consolas, "Courier New", monospace; user-select:none;
+  }
+  /* 顶部信息栏：分数 / 最高分 / 速度 */
+  #hud {
+    display:flex; gap:24px; font-size:16px;
+    background:#1e293b; padding:10px 18px; border-radius:8px;
+    border:1px solid #334155;
+  }
+  #hud b { color:#4ade80; }
+  /* 画布容器（相对定位，用于叠加 Game Over 蒙层） */
+  #wrap { position:relative; border:2px solid #334155; border-radius:8px; overflow:hidden; }
+  canvas { display:block; background:#0b1120; }
+  /* Game Over 半透明蒙层 */
+  #overlay {
+    position:absolute; inset:0; display:none;
+    flex-direction:column; align-items:center; justify-content:center;
+    gap:8px; background:rgba(2,6,23,.82); text-align:center;
+  }
+  #overlay.show { display:flex; }
+  #overlay h1 { color:#f87171; margin:0; font-size:34px; letter-spacing:2px; }
+  #overlay p  { margin:0; font-size:16px; }
+  .btn {
+    margin-top:6px; padding:8px 22px; cursor:pointer;
+    background:#16a34a; color:#fff; border:none; border-radius:6px;
+    font-size:15px; font-family:inherit;
+  }
+  .btn:hover { background:#15803d; }
+  #hint { color:#94a3b8; font-size:13px; }
+</style>
+</head>
+<body>
+
+  <!-- 顶部信息栏（需求5/6：分数、最高分、当前速度） -->
+  <div id="hud">
+    <span>得分 <b id="scoreVal">0</b></span>
+    <span>最高 <b id="bestVal">0</b></span>
+    <span>速度 <b id="speedVal">200ms</b></span>
+  </div>
+
+  <!-- 画布 + 蒙层 -->
+  <div id="wrap">
+    <canvas id="game" width="528" height="528"></canvas>   <!-- (20+2)*24 -->
+    <div id="overlay">
+      <h1>GAME OVER</h1>
+      <p id="finalMsg"></p>
+      <button class="btn" onclick="restart()">再玩一次 (空格)</button>
+    </div>
+  </div>
+
+  <div id="hint">方向键 / WASD 控制 · 撞墙或撞自己结束 · 每 50 分提速 · 按住方向键持续移动</div>
+
+<script>
+/* ============================================================================
+ * 控制台版贪吃蛇 -> 网页版（Canvas）移植
+ * 移植要点（与 C++ 版一一对应）：
+ *   - 蛇身仍用数组（0 号 = 蛇头）+ occ 占用表，移动 O(1)
+ *   - 掉头判定仍用 (nd^1)!=dir 的异或技巧
+ *   - 回合制：rAF 累积时间，每累计满 speedMs() 就走一步（越吃越快）
+ *   - best.txt  ->  localStorage；控制台光标重绘 -> Canvas（天然无闪烁）
+ * ========================================================================== */
+
+const W = 20, H = 20;                     // 游戏区 20×20（不含四周墙）
+const CELL = 24;                          // 每格像素（含墙一共 22×24=528）
+
+/* 方向：0上 1下 2左 3右，a 与 (a^1) 互为反向 */
+const DX = [ 0, 0,-1, 1 ];
+const DY = [-1, 1, 0, 0 ];
+const KEY_DIR = {                          // 键盘 -> 方向 对照表
+  'w':0,'W':0,'ArrowUp':0,
+  's':1,'S':1,'ArrowDown':1,
+  'a':2,'A':2,'ArrowLeft':2,
+  'd':3,'D':3,'ArrowRight':3,
+};
+
+const canvas = document.getElementById('game');
+const ctx    = canvas.getContext('2d');
+
+/* ============================ 全局游戏状态 ============================ */
+let snake = [];          // 蛇身：snake[0] 是蛇头，末位是蛇尾（同 C++ 的 deque）
+let occ   = [];          // occ[y][x]=true 表示被蛇占用（O(1) 判撞自己）
+let food  = null;        // {x,y}
+let dir   = 3;           // 当前朝向（初始向右）
+let score = 0, best = 0;
+let gameOver = false;
+
+/* ============================ 最高分存取 ============================ */
+function loadBest() {
+  try { return parseInt(localStorage.getItem('snakeBest') || '0', 10) || 0; }
+  catch (e) { return 0; }                  // 个别隐私模式下 localStorage 不可用
+}
+function saveBest(v) {
+  try { localStorage.setItem('snakeBest', String(v)); } catch (e) {}
+}
+
+/* ============================ 游戏逻辑（与 C++ 版一致） ============================ */
+
+// 移动间隔：基础 200ms，每 50 分 -15ms，下限 60ms（需求5）
+function speedMs() { return Math.max(60, 200 - Math.floor(score / 50) * 15); }
+
+// 在空白格随机放食物；全图被占满视为“通关胜利”（防御处理）
+function spawnFood() {
+  const free = [];
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++)
+      if (!occ[y][x]) free.push([x, y]);
+  if (free.length === 0) { gameOver = true; return; }   // 占满全图 -> 胜利
+  const p = free[(Math.random() * free.length) | 0];
+  food = { x: p[0], y: p[1] };
+}
+
+// 初始化 / 重开一局（需求8 的“再来一局”）
+function initGame() {
+  snake = [ {x:12,y:10}, {x:11,y:10}, {x:10,y:10} ];    // 0 号 = 蛇头
+  occ = Array.from({ length: H }, () => Array(W).fill(false));
+  snake.forEach(p => occ[p.y][p.x] = true);
+  score = 0; gameOver = false; dir = 3;
+  spawnFood();
+}
+
+// 走一步：撞墙 -> 撞自己 -> 吃食物，顺序与 C++ 版完全一致
+function step() {
+  const head = snake[0];
+  const nx = head.x + DX[dir], ny = head.y + DY[dir];
+
+  // 1) 撞四周墙（越界）-> 结束
+  if (nx < 0 || nx >= W || ny < 0 || ny >= H) { gameOver = true; return; }
+
+  const eat = (nx === food.x && ny === food.y);          // 2) 吃到食物？
+
+  // 3) 撞自己：唯一安全例外是目标格=蛇尾 且本步没吃到（蛇尾会让位）
+  if (occ[ny][nx]) {
+    const tail = snake[snake.length - 1];
+    const isTail = (nx === tail.x && ny === tail.y);
+    if (!isTail || eat) { gameOver = true; return; }     // 吃着撞尾也判死
+  }
+
+  if (!eat) {                                            // 没吃到：删尾（长度不变）
+    const tail = snake.pop();
+    occ[tail.y][tail.x] = false;
+  } else {                                               // 吃到：+10 分，尾部保留 -> 变长
+    score += 10;
+  }
+
+  snake.unshift({ x: nx, y: ny });                       // 新头入列
+  occ[ny][nx] = true;
+  if (eat) spawnFood();                                  // 重新放食物
+}
+
+/* ============================ 渲染（Canvas 天然无闪烁） ============================ */
+function draw() {
+  ctx.fillStyle = '#0b1120';                             // 背景
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // 四周墙（需求1：边界视为墙，画成灰色方块）
+  ctx.fillStyle = '#475569';
+  for (let i = 0; i < W + 2; i++) {
+    ctx.fillRect(i * CELL, 0, CELL, CELL);               // 顶墙
+    ctx.fillRect(i * CELL, (H + 1) * CELL, CELL, CELL);  // 底墙
+  }
+  for (let j = 1; j <= H; j++) {
+    ctx.fillRect(0, j * CELL, CELL, CELL);               // 左墙
+    ctx.fillRect((W + 1) * CELL, j * CELL, CELL, CELL);  // 右墙
+  }
+
+  // 食物（需求3）：红色圆点
+  if (food) {
+    ctx.fillStyle = '#ef4444';
+    ctx.beginPath();
+    ctx.arc((food.x + 1) * CELL + CELL/2, (food.y + 1) * CELL + CELL/2,
+            CELL * 0.35, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // 蛇身（绿）/ 蛇头（亮绿），各格留 1px 间距看起来更精致
+  for (let i = snake.length - 1; i >= 0; i--) {          // 先画尾，头在最上层
+    const p = snake[i];
+    ctx.fillStyle = (i === 0) ? '#4ade80' : '#16a34a';
+    const x0 = (p.x + 1) * CELL + 2, y0 = (p.y + 1) * CELL + 2;
+    ctx.fillRect(x0, y0, CELL - 4, CELL - 4);
+  }
+}
+
+/* ============================ HUD 与 Game Over ============================ */
+function updateHud() {
+  document.getElementById('scoreVal').textContent = score;
+  document.getElementById('bestVal').textContent = best;
+  document.getElementById('speedVal').textContent = speedMs() + 'ms';
+}
+
+function showGameOver() {
+  if (score > best) { best = score; saveBest(best); }    // 需求6：更新并保存最高分
+  document.getElementById('finalMsg').textContent =
+    '本局得分 ' + score + (score === best && score > 0 ? '  🏆 新纪录！' : '');
+  document.getElementById('bestVal').textContent = best;
+  document.getElementById('overlay').classList.add('show');  // 需求4：显示 Game Over
+}
+
+/* ============================ 主循环（rAF + 时间累积） ============================ */
+let last = 0, acc = 0, rafId = 0;
+
+function frame(t) {
+  if (gameOver) return;                                  // 结束后停掉循环
+  if (last === 0) last = t;
+  const dt = Math.min(50, t - last); last = t;           // 防切标签页回来瞬间连跳
+  acc += dt;
+
+  const ms = speedMs();
+  while (acc >= ms) {                                    // 每满一格走一步
+    acc -= ms;
+    step();
+    if (gameOver) break;                                 // 中途死了就停下
+  }
+
+  draw(); updateHud();
+  if (!gameOver) rafId = requestAnimationFrame(frame);    // 继续下一帧
+  else showGameOver();
+}
+
+function start() { last = 0; acc = 0; rafId = requestAnimationFrame(frame); }
+
+// 重开（按钮 / 空格 / 回车 都走这里）
+function restart() {
+  document.getElementById('overlay').classList.remove('show');
+  initGame();
+  start();
+}
+
+/* ============================ 键盘输入 ============================ */
+window.addEventListener('keydown', (e) => {
+  const k = e.key;
+  // 阻止方向键/空格滚动页面
+  if (k.startsWith('Arrow') || k === ' ') e.preventDefault();
+
+  if (gameOver) {                                        // 结束后：空格/回车重开
+    if (k === ' ' || k === 'Enter') restart();
+    return;
+  }
+  if (k in KEY_DIR) {
+    const nd = KEY_DIR[k];
+    if ((nd ^ 1) !== dir) dir = nd;                      // 需求2：禁 180° 掉头
+    // 方向一旦设定会一直保持 -> 按住键（浏览器自动重复触发 keydown）
+    // 只是重复“确认同方向”，蛇按自己节奏持续移动 => 按住不放持续移动成立
+  }
+});
+
+/* ============================ 启动 ============================ */
+best = loadBest();
+updateHud();
+initGame();
+start();
+</script>
+</body>
+</html>
